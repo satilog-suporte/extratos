@@ -1,0 +1,20 @@
+{
+  "name": "bradesco-bff",
+  "version": "1.0.0",
+  "description": "BFF/Proxy para as APIs de Saldo e Extrato do Bradesco (Open Finance) com mTLS e suporte multi-empresa.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=18.x"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "vercel": "^54.1.0"
+  }
+}
