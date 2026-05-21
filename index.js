@@ -2,18 +2,64 @@
 
 require('dotenv').config();
 
-const express = require('express');
-const cors    = require('cors');
+const crypto = require('crypto');
 
-const { UNITS_VALID, consultarSaldo, consultarExtrato } = require('./lib/bradesco');
+const express      = require('express');
+const cors         = require('cors');
+const helmet       = require('helmet');
+const rateLimit    = require('express-rate-limit');
+
+const { getUnitsValid, consultarSaldo, consultarExtrato, UnitNotConfiguredError } = require('./lib/bradesco');
+const { consultarExtratoBB }                                                      = require('./lib/bb');
 
 const app = express();
 
 // ─────────────────────────────────────────────
+// Logger estruturado (JSON)
+// Facilita busca e análise de logs no painel da Vercel em produção.
+// ─────────────────────────────────────────────
+function log(level, message, extra = {}) {
+  console[level === 'error' ? 'error' : 'log'](
+    JSON.stringify({ level, ts: new Date().toISOString(), message, ...extra })
+  );
+}
+
+// ─────────────────────────────────────────────
 // Middleware global
 // ─────────────────────────────────────────────
-app.use(cors());
-app.use(express.json());
+
+// CSP explícito: false desabilita o header (esta API só serve JSON, não HTML).
+app.use(helmet({ contentSecurityPolicy: false }));
+
+// CORS restrito ao domínio do frontend configurado em ALLOWED_ORIGIN.
+const allowedOrigin = process.env.ALLOWED_ORIGIN;
+app.use(cors(
+  allowedOrigin
+    ? { origin: allowedOrigin }
+    : undefined
+));
+
+app.use(express.json({ limit: '10kb' }));
+
+// ─────────────────────────────────────────────
+// Correlation ID — injeta um ID único por request para rastrear
+// logs entre index.js, lib/ e chamadas ao banco.
+// O cliente pode enviar seu próprio ID via x-request-id; senão geramos um.
+// ─────────────────────────────────────────────
+app.use((req, res, next) => {
+  req.correlationId = (req.headers['x-request-id'] || crypto.randomUUID()).slice(0, 64);
+  res.set('x-request-id', req.correlationId);
+  next();
+});
+
+// Rate limiter — protege as rotas de API contra abuso.
+const apiLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Muitas requisições. Tente novamente em instantes.' },
+});
 
 // ─────────────────────────────────────────────
 // Middleware de Autenticação da nossa API
@@ -21,29 +67,30 @@ app.use(express.json());
 // O frontend deve enviar a chave em um dos formatos:
 //   Header:  x-api-key: <chave>
 //   Header:  Authorization: Bearer <chave>
-//
-// A chave é comparada com a variável FRONTEND_API_KEY.
 // ─────────────────────────────────────────────
 function authMiddleware(req, res, next) {
   const apiKey = process.env.FRONTEND_API_KEY;
 
   if (!apiKey) {
-    // Configuração ausente no servidor — não deve chegar em produção.
     return res.status(500).json({
       error: 'Configuração interna inválida: FRONTEND_API_KEY não definida no servidor.',
     });
   }
 
-  // Extrai a chave enviada pelo cliente.
-  const fromHeader  = req.headers['x-api-key'];
-  const authHeader  = req.headers['authorization'] ?? '';
-  const fromBearer  = authHeader.startsWith('Bearer ')
+  const fromHeader = req.headers['x-api-key'];
+  const authHeader = req.headers['authorization'] ?? '';
+  const fromBearer = authHeader.startsWith('Bearer ')
     ? authHeader.slice(7).trim()
     : null;
 
   const receivedKey = fromHeader || fromBearer;
 
-  if (!receivedKey || receivedKey !== apiKey) {
+  // Comparação timing-safe para evitar ataques de enumeração por timing.
+  const keysMatch = receivedKey &&
+    receivedKey.length === apiKey.length &&
+    crypto.timingSafeEqual(Buffer.from(receivedKey), Buffer.from(apiKey));
+
+  if (!keysMatch) {
     return res.status(401).json({
       error: 'Não autorizado. Envie a chave correta no header "x-api-key" ou "Authorization: Bearer <chave>".',
     });
@@ -52,17 +99,46 @@ function authMiddleware(req, res, next) {
   next();
 }
 
-// Aplica o middleware em todas as rotas /api/*
+// Health-check público — deve ficar ANTES do middleware de autenticação.
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ status: 'ok', ts: new Date().toISOString() });
+});
+
+// Rate limiter — aplicado a todas as rotas /api/* exceto health check.
+// Nota: dentro de app.use('/api', ...) o Express já normaliza req.path,
+// então /api//health chega como req.path === '/health' — o check abaixo é seguro.
+app.use('/api', (req, res, next) => {
+  if (req.path === '/health') return next();
+  return apiLimiter(req, res, next);
+});
+
 app.use('/api', authMiddleware);
 
+// Timeout por request — cancela a resposta se o handler demorar mais que 28s.
+// Fica abaixo do limite máximo da Vercel (30s), dando margem para fechar
+// a conexão de forma limpa antes do hard-kill da plataforma.
+app.use((req, res, next) => {
+  const TIMEOUT_MS = 28_000;
+  const timer = setTimeout(() => {
+    if (!res.headersSent) {
+      log('error', 'Request timeout', { correlationId: req.correlationId, path: req.path });
+      res.status(504).json({ error: 'O servidor não conseguiu responder a tempo. Tente novamente.' });
+    }
+  }, TIMEOUT_MS);
+  res.on('finish', () => clearTimeout(timer));
+  res.on('close',  () => clearTimeout(timer));
+  next();
+});
+
 // ─────────────────────────────────────────────
-// Helper: valida e normaliza parâmetros comuns
+// Helpers compartilhados
 // ─────────────────────────────────────────────
-function validarUnidade(unidade, res) {
+
+function validarUnidade(unidade, validList, banco, res) {
   const u = unidade?.toLowerCase();
-  if (!UNITS_VALID.includes(u)) {
+  if (!validList.includes(u)) {
     res.status(400).json({
-      error: `Unidade inválida: "${unidade}". Use "matriz" ou "filial".`,
+      error: `Unidade inválida para ${banco}: "${unidade}". Use: ${validList.join(', ')}.`,
     });
     return null;
   }
@@ -71,83 +147,137 @@ function validarUnidade(unidade, res) {
 
 function validarAgenciaConta(agencia, conta, res) {
   if (!agencia || !conta) {
-    res.status(400).json({
-      error: 'Os parâmetros "agencia" e "conta" são obrigatórios.',
-    });
+    res.status(400).json({ error: 'Os parâmetros "agencia" e "conta" são obrigatórios.' });
     return false;
   }
 
-  const agenciaStr = String(agencia).trim();
-  const contaStr   = String(conta).trim();
-
-  if (!/^\d{1,4}$/.test(agenciaStr)) {
+  if (!/^\d{1,4}$/.test(String(agencia).trim())) {
     res.status(400).json({ error: 'Agência inválida. Deve conter até 4 dígitos numéricos.' });
     return false;
   }
 
-  if (!/^\d{1,7}$/.test(contaStr)) {
-    res.status(400).json({ error: 'Conta inválida. Deve conter até 7 dígitos numéricos.' });
+  if (!/^\d+$/.test(String(conta).trim())) {
+    res.status(400).json({ error: 'Conta inválida. Deve conter apenas dígitos numéricos.' });
     return false;
   }
 
   return true;
 }
 
-// Garante 7 dígitos com zeros à esquerda, conforme exigência da API.
+/**
+ * Valida e faz parse de uma data no formato DDMMAAAA.
+ * Retorna um objeto Date se válida, ou null se inválida.
+ */
+function parseDDMMAAAA(s) {
+  if (!/^\d{8}$/.test(s)) return null;
+
+  const d = parseInt(s.slice(0, 2), 10);
+  const m = parseInt(s.slice(2, 4), 10);
+  const y = parseInt(s.slice(4), 10);
+
+  const dt = new Date(y, m - 1, d);
+
+  // Verifica se a data "virou" (ex: dia 32 vira dia 1 do mês seguinte)
+  if (dt.getFullYear() !== y || dt.getMonth() !== m - 1 || dt.getDate() !== d) {
+    return null;
+  }
+
+  return dt;
+}
+
+/**
+ * Valida dataInicio e dataFim:
+ *   - Formato DDMMAAAA
+ *   - Datas reais (sem dias/meses impossíveis)
+ *   - dataFim >= dataInicio
+ *   - Período máximo em dias (0 = sem limite)
+ */
+function validarDatas(dataInicio, dataFim, res, maxDias = 0) {
+  if (!dataInicio || !dataFim) {
+    res.status(400).json({
+      error: 'Os parâmetros "dataInicio" e "dataFim" são obrigatórios (formato DDMMAAAA).',
+    });
+    return null;
+  }
+
+  const dtInicio = parseDDMMAAAA(dataInicio);
+  const dtFim    = parseDDMMAAAA(dataFim);
+
+  if (!dtInicio) {
+    res.status(400).json({ error: `"dataInicio" inválida: "${dataInicio}". Use o formato DDMMAAAA com uma data real.` });
+    return null;
+  }
+
+  if (!dtFim) {
+    res.status(400).json({ error: `"dataFim" inválida: "${dataFim}". Use o formato DDMMAAAA com uma data real.` });
+    return null;
+  }
+
+  if (dtFim < dtInicio) {
+    res.status(400).json({ error: '"dataFim" deve ser igual ou posterior a "dataInicio".' });
+    return null;
+  }
+
+  if (maxDias > 0) {
+    const diffDias = Math.floor((dtFim - dtInicio) / 86_400_000);
+    if (diffDias > maxDias) {
+      res.status(400).json({ error: `Período máximo permitido: ${maxDias} dias.` });
+      return null;
+    }
+  }
+
+  return { dtInicio, dtFim };
+}
+
 function padConta(conta) {
   return String(conta).trim().padStart(7, '0');
 }
 
-// ─────────────────────────────────────────────
-// Helper: trata erros do Axios de forma padronizada
-// ─────────────────────────────────────────────
-function handleAxiosError(err, res) {
-  console.error('[BFF] Erro na chamada ao Bradesco:', err.message);
+function handleAxiosError(err, res, req) {
+  // Unidade Bradesco sem variáveis configuradas → 503
+  if (err instanceof UnitNotConfiguredError) {
+    log('error', err.message, { correlationId: req?.correlationId });
+    return res.status(503).json({
+      error: 'Esta unidade não está disponível no momento. Verifique a configuração do servidor.',
+    });
+  }
+
+  log('error', 'Erro na chamada ao banco', { correlationId: req?.correlationId, stack: err.stack });
 
   if (err.response) {
-    // O Bradesco respondeu com um status de erro (4xx / 5xx).
+    // Logamos apenas o status HTTP — nunca o payload (pode conter PII financeira: saldos, transações).
+    log('error', 'Resposta de erro do banco', { correlationId: req?.correlationId, httpStatus: err.response.status });
     return res.status(err.response.status).json({
-      error:   'Erro retornado pelo Bradesco.',
-      details: err.response.data,
+      error: 'Erro retornado pelo banco.',
     });
   }
 
   if (err.request) {
-    // A requisição foi feita mas não houve resposta (timeout, rede).
     return res.status(504).json({
-      error: 'O Bradesco não respondeu dentro do tempo limite. Tente novamente.',
+      error: 'O banco não respondeu dentro do tempo limite. Tente novamente.',
     });
   }
 
-  // Erro de configuração / lógica interna.
   return res.status(500).json({
-    error:   'Erro interno do servidor.',
-    message: err.message,
+    error: 'Erro interno do servidor.',
   });
 }
 
 // ─────────────────────────────────────────────
-// GET /api/:unidade/saldo
-//
-// Query params:
-//   agencia      (obrigatório) — até 4 dígitos
-//   conta        (obrigatório) — até 7 dígitos (será padded)
-//   tipoOperacao (opcional)    — 1 ou 2
-//
-// Exemplo:
-//   GET /api/matriz/saldo?agencia=1234&conta=30524
-//   GET /api/filial/saldo?agencia=5678&conta=0012345&tipoOperacao=2
+// Handlers reutilizáveis — elimina duplicação entre
+// rotas novas (/bradesco/:unidade) e legadas (/:unidade)
 // ─────────────────────────────────────────────
-app.get('/api/:unidade/saldo', async (req, res) => {
-  const unidade = validarUnidade(req.params.unidade, res);
+
+async function handleBradescoSaldo(req, res) {
+  const unidades = getUnitsValid();
+  const unidade  = validarUnidade(req.params.unidade, unidades, 'Bradesco', res);
   if (!unidade) return;
 
   const { agencia, conta, tipoOperacao } = req.query;
 
   if (!validarAgenciaConta(agencia, conta, res)) return;
 
-  // Validação opcional de tipoOperacao.
-  if (tipoOperacao && !['1', '2'].includes(String(tipoOperacao))) {
+  if (tipoOperacao && !['1', '2'].includes(String(tipoOperacao).trim())) {
     return res.status(400).json({ error: 'tipoOperacao deve ser "1" ou "2".' });
   }
 
@@ -155,58 +285,34 @@ app.get('/api/:unidade/saldo', async (req, res) => {
     const dados = await consultarSaldo(unidade, {
       agencia:      String(agencia).trim(),
       conta:        padConta(conta),
-      tipoOperacao: tipoOperacao || undefined,
+      tipoOperacao: tipoOperacao ? String(tipoOperacao).trim() : undefined,
     });
-
     return res.status(200).json(dados);
   } catch (err) {
-    return handleAxiosError(err, res);
+    return handleAxiosError(err, res, req);
   }
-});
+}
 
-// ─────────────────────────────────────────────
-// GET /api/:unidade/extrato
-//
-// Query params:
-//   agencia      (obrigatório) — até 4 dígitos
-//   conta        (obrigatório) — até 7 dígitos (será padded)
-//   dataInicio   (obrigatório) — formato DDMMAAAA
-//   dataFim      (obrigatório) — formato DDMMAAAA
-//   tipo         (obrigatório) — "cc" ou "cp"
-//   tipoOperacao (opcional)    — 1 ou 2
-//
-// Exemplo:
-//   GET /api/matriz/extrato?agencia=1234&conta=30524&dataInicio=01052025&dataFim=31052025&tipo=cc
-// ─────────────────────────────────────────────
-app.get('/api/:unidade/extrato', async (req, res) => {
-  const unidade = validarUnidade(req.params.unidade, res);
+async function handleBradescoExtrato(req, res) {
+  const unidades = getUnitsValid();
+  const unidade  = validarUnidade(req.params.unidade, unidades, 'Bradesco', res);
   if (!unidade) return;
 
   const { agencia, conta, dataInicio, dataFim, tipo, tipoOperacao } = req.query;
 
   if (!validarAgenciaConta(agencia, conta, res)) return;
+  if (!validarDatas(dataInicio, dataFim, res)) return;
 
-  // Valida datas.
-  if (!dataInicio || !dataFim) {
-    return res.status(400).json({ error: 'Os parâmetros "dataInicio" e "dataFim" são obrigatórios (formato DDMMAAAA).' });
-  }
-
-  if (!/^\d{8}$/.test(dataInicio) || !/^\d{8}$/.test(dataFim)) {
-    return res.status(400).json({ error: 'Formato de data inválido. Use DDMMAAAA (ex: 01052025).' });
-  }
-
-  // Valida tipo de conta.
   if (!tipo) {
     return res.status(400).json({ error: 'O parâmetro "tipo" é obrigatório. Use "cc" (corrente) ou "cp" (poupança).' });
   }
 
   const tipoNorm = String(tipo).toLowerCase();
   if (!['cc', 'cp'].includes(tipoNorm)) {
-    return res.status(400).json({ error: 'Parâmetro "tipo" inválido. Use "cc" (corrente) ou "cp" (poupança).' });
+    return res.status(400).json({ error: 'Parâmetro "tipo" inválido. Use "cc" ou "cp".' });
   }
 
-  // Validação opcional de tipoOperacao.
-  if (tipoOperacao && !['1', '2'].includes(String(tipoOperacao))) {
+  if (tipoOperacao && !['1', '2'].includes(String(tipoOperacao).trim())) {
     return res.status(400).json({ error: 'tipoOperacao deve ser "1" ou "2".' });
   }
 
@@ -217,37 +323,164 @@ app.get('/api/:unidade/extrato', async (req, res) => {
       dataInicio:   String(dataInicio).trim(),
       dataFim:      String(dataFim).trim(),
       tipo:         tipoNorm,
-      tipoOperacao: tipoOperacao || undefined,
+      tipoOperacao: tipoOperacao ? String(tipoOperacao).trim() : undefined,
+    });
+    return res.status(200).json(dados);
+  } catch (err) {
+    return handleAxiosError(err, res, req);
+  }
+}
+
+// ═════════════════════════════════════════════
+// BRADESCO
+// ═════════════════════════════════════════════
+
+/**
+ * GET /api/bradesco/:unidade/saldo
+ *
+ * Query params:
+ *   agencia      (obrigatório) — até 4 dígitos
+ *   conta        (obrigatório) — até 7 dígitos (será padded)
+ *   tipoOperacao (opcional)    — "1" ou "2"
+ *
+ * Exemplo:
+ *   GET /api/bradesco/matriz/saldo?agencia=1234&conta=30524
+ */
+app.get('/api/bradesco/:unidade/saldo', handleBradescoSaldo);
+
+/**
+ * GET /api/bradesco/:unidade/extrato
+ *
+ * Query params:
+ *   agencia      (obrigatório) — até 4 dígitos
+ *   conta        (obrigatório) — até 7 dígitos (será padded)
+ *   dataInicio   (obrigatório) — DDMMAAAA
+ *   dataFim      (obrigatório) — DDMMAAAA
+ *   tipo         (obrigatório) — "cc" ou "cp"
+ *   tipoOperacao (opcional)    — "1" ou "2"
+ *
+ * Exemplo:
+ *   GET /api/bradesco/matriz/extrato?agencia=1234&conta=30524&dataInicio=01052025&dataFim=31052025&tipo=cc
+ */
+app.get('/api/bradesco/:unidade/extrato', handleBradescoExtrato);
+
+// ═════════════════════════════════════════════
+// BANCO DO BRASIL
+// (registrado antes das rotas legadas /api/:unidade/* para evitar conflito)
+// ═════════════════════════════════════════════
+
+/**
+ * GET /api/bb/extrato
+ *
+ * Consulta extrato de conta corrente via API BB (Open Finance).
+ * Apenas conta da Matriz — credenciais únicas via BB_CLIENT_ID / BB_CLIENT_SECRET / BB_APP_KEY.
+ *
+ * Query params:
+ *   agencia      (obrigatório) — até 4 dígitos, sem DV
+ *   conta        (obrigatório) — dígitos numéricos, sem DV
+ *   dataInicio   (opcional*)  — DDMMAAAA  ex: 01052025
+ *   dataFim      (opcional*)  — DDMMAAAA  ex: 31052025
+ *   pagina       (opcional)   — número da página, padrão 1
+ *   pageSize     (opcional)   — registros por página, 50–200, padrão 200
+ *
+ * * Se uma das datas for informada, a outra é obrigatória.
+ *   Sem datas → retorna os últimos 30 dias.
+ *   Período máximo entre dataInicio e dataFim: 31 dias.
+ *
+ * Exemplos:
+ *   GET /api/bb/extrato?agencia=1505&conta=1348
+ *   GET /api/bb/extrato?agencia=1505&conta=1348&dataInicio=01052025&dataFim=31052025
+ *   GET /api/bb/extrato?agencia=1505&conta=1348&dataInicio=01052025&dataFim=31052025&pagina=2&pageSize=100
+ */
+app.get('/api/bb/extrato', async (req, res) => {
+  const { agencia, conta, dataInicio, dataFim, pagina, pageSize } = req.query;
+
+  if (!validarAgenciaConta(agencia, conta, res)) return;
+
+  // Se UMA das datas for informada, AMBAS são obrigatórias.
+  if ((dataInicio && !dataFim) || (!dataInicio && dataFim)) {
+    return res.status(400).json({
+      error: 'Se "dataInicio" for informado, "dataFim" também é obrigatório — e vice-versa.',
+    });
+  }
+
+  // Valida datas com período máximo de 31 dias (exigência da API BB).
+  if (dataInicio && dataFim) {
+    if (!validarDatas(dataInicio, dataFim, res, 31)) return;
+  }
+
+  // Valida paginação.
+  const numeroPagina = pagina ? Number(pagina) : 1;
+  if (!Number.isInteger(numeroPagina) || numeroPagina < 1) {
+    return res.status(400).json({ error: 'O parâmetro "pagina" deve ser um inteiro >= 1.' });
+  }
+
+  const tamanhoPagina = pageSize ? Number(pageSize) : 200;
+  if (!Number.isInteger(tamanhoPagina) || tamanhoPagina < 50 || tamanhoPagina > 200) {
+    return res.status(400).json({ error: 'O parâmetro "pageSize" deve ser um inteiro entre 50 e 200.' });
+  }
+
+  try {
+    const dados = await consultarExtratoBB({
+      agencia:      String(agencia).trim(),
+      conta:        String(conta).trim(),
+      dataInicio:   dataInicio ? String(dataInicio).trim() : undefined,
+      dataFim:      dataFim    ? String(dataFim).trim()    : undefined,
+      numeroPagina,
+      tamanhoPagina,
     });
 
     return res.status(200).json(dados);
   } catch (err) {
-    return handleAxiosError(err, res);
+    return handleAxiosError(err, res, req);
   }
 });
 
-// ─────────────────────────────────────────────
-// Health-check (rota pública, sem auth)
-// ─────────────────────────────────────────────
-app.get('/api/health', (req, res) => {
-  res.status(200).json({ status: 'ok', ts: new Date().toISOString() });
+// ═════════════════════════════════════════════
+// Rotas legadas Bradesco sem prefixo /bradesco
+// (mantidas para retrocompatibilidade; ficam APÓS /api/bb/* para não conflitar)
+// ═════════════════════════════════════════════
+app.get('/api/:unidade/saldo', (req, res, next) => {
+  res.set('Deprecation', 'true');
+  res.set('Link', '</api/bradesco/' + req.params.unidade + '/saldo>; rel="successor-version"');
+  return handleBradescoSaldo(req, res, next);
 });
 
-// ─────────────────────────────────────────────
-// 404 para rotas não mapeadas
-// ─────────────────────────────────────────────
+app.get('/api/:unidade/extrato', (req, res, next) => {
+  res.set('Deprecation', 'true');
+  res.set('Link', '</api/bradesco/' + req.params.unidade + '/extrato>; rel="successor-version"');
+  return handleBradescoExtrato(req, res, next);
+});
+
+// ═════════════════════════════════════════════
+// 404
+// ═════════════════════════════════════════════
 app.use((req, res) => {
   res.status(404).json({ error: `Rota não encontrada: ${req.method} ${req.path}` });
 });
 
-// ─────────────────────────────────────────────
-// Export para Vercel Serverless + start local
-// ─────────────────────────────────────────────
+// ═════════════════════════════════════════════
+// Global error handler — captura erros assíncronos não tratados
+// que escaparam do try/catch nas rotas (ex: bugs de middleware).
+// ═════════════════════════════════════════════
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  log('error', 'Erro não tratado capturado pelo global handler', {
+    method: req.method,
+    path:   req.path,
+    stack:  err.stack,
+  });
+  res.status(500).json({ error: 'Erro interno do servidor.' });
+});
+
+// ═════════════════════════════════════════════
+// Export Vercel + start local
+// ═════════════════════════════════════════════
 module.exports = app;
 
 if (require.main === module) {
   const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
-    console.log(`[BFF] Servidor rodando em http://localhost:${PORT}`);
+    log('info', `Servidor rodando`, { port: PORT });
   });
 }
