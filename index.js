@@ -14,6 +14,11 @@ const { consultarExtratoBB }                                                    
 
 const app = express();
 
+// ✅ ADICIONAR ESTA LINHA
+// "1" = confiar em 1 nível de proxy (o da Vercel).
+// Isso faz o Express usar X-Forwarded-For para identificar o IP real do cliente.
+app.set('trust proxy', 1);
+
 // ─────────────────────────────────────────────
 // Logger estruturado (JSON)
 // Facilita busca e análise de logs no painel da Vercel em produção.
