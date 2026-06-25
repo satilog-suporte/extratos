@@ -420,9 +420,9 @@ app.get('/api/bb/extrato', async (req, res) => {
     return res.status(400).json({ error: 'O parâmetro "pagina" deve ser um inteiro >= 1.' });
   }
 
-  const tamanhoPagina = pageSize ? Number(pageSize) : 200;
-  if (!Number.isInteger(tamanhoPagina) || tamanhoPagina < 50 || tamanhoPagina > 200) {
-    return res.status(400).json({ error: 'O parâmetro "pageSize" deve ser um inteiro entre 50 e 200.' });
+  const tamanhoPagina = pageSize ? Number(pageSize) : 120;
+  if (!Number.isInteger(tamanhoPagina) || tamanhoPagina < 50 || tamanhoPagina > 120) {
+  return res.status(400).json({ error: 'O parâmetro "pageSize" deve ser um inteiro entre 50 e 120.' });
   }
 
   try {
